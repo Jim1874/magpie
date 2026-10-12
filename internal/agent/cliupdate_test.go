@@ -326,6 +326,76 @@ func TestUpdateCLI(t *testing.T) {
 	}
 }
 
+// An npm update of Claude Code whose postinstall didn't run leaves
+// bin/claude.exe the stub printing "native binary not installed": magpie
+// runs the package's own install.cjs, which places the already-downloaded
+// platform binary. Nothing real is installed or updated.
+func TestUpdateCLIRunsClaudePostinstall(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("a shell script as the CLI")
+	}
+	tmp, _ := filepath.EvalSymlinks(t.TempDir())
+	stub := "echo \"Error: claude native binary not installed.\" >&2\nexit 1\n"
+
+	setup := func(t *testing.T, withInstall bool) (prefix, bin string) {
+		t.Helper()
+		prefix = filepath.Join(tmp, strings.ReplaceAll(t.Name(), "/", "-"))
+		pkg := filepath.Join(prefix, "lib/node_modules/@anthropic-ai/claude-code")
+		file(t, filepath.Join(pkg, "bin/claude.exe"), stub)
+		file(t, filepath.Join(pkg, "package.json"), `{"name":"@anthropic-ai/claude-code","version":"2.1.296"}`)
+		if withInstall {
+			file(t, filepath.Join(pkg, "node_modules/@anthropic-ai/claude-code-darwin-arm64/claude"), "native-bytes")
+			// the package's own postinstall: place the platform binary over
+			// the stub, as the real install.cjs links or copies it
+			file(t, filepath.Join(pkg, "install.cjs"), "#!/bin/sh\ncp \""+filepath.Join(pkg, "node_modules/@anthropic-ai/claude-code-darwin-arm64/claude")+"\" \""+filepath.Join(pkg, "bin/claude.exe")+"\"\n")
+		}
+		file(t, filepath.Join(prefix, "bin/npm"), "#!/bin/sh\nexit 1\n")
+		// its own node, which runs install.cjs: a stand-in running the
+		// script, as the code runs whatever node the prefix has
+		file(t, filepath.Join(prefix, "bin/node"), "#!/bin/sh\nsh \"$1\"\n")
+		bin = link(t, "../lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe", filepath.Join(prefix, "bin/claude"))
+		// the fakes first, the system's sh and cp after: node and
+		// install.cjs are scripts running those
+		t.Setenv("PATH", filepath.Join(prefix, "bin")+string(os.PathListSeparator)+os.Getenv("PATH"))
+		return prefix, bin
+	}
+
+	oldReg, oldRun := npmRegistry, runUpdate
+	npmRegistry = "http://127.0.0.1:1/"
+	versions, latests = memo{}, memo{}
+	runUpdate = func(context.Context, *updater) ([]byte, error) { return []byte("added 1 package"), nil }
+	t.Cleanup(func() { npmRegistry, runUpdate = oldReg, oldRun; versions, latests = memo{}, memo{} })
+
+	t.Run("stub left is placed", func(t *testing.T) {
+		_, bin := setup(t, true)
+		a := &Agent{ID: "claude", Name: "Claude Code", Bin: "claude"}
+		if _, err := a.UpdateCLI(); err != nil {
+			t.Fatalf("UpdateCLI: %v", err)
+		}
+		if b, _ := os.ReadFile(bin); string(b) != "native-bytes" {
+			t.Errorf("stub still there: %q", b)
+		}
+	})
+
+	t.Run("binary in place runs nothing", func(t *testing.T) {
+		_, bin := setup(t, false)
+		os.WriteFile(bin, []byte(strings.Repeat("N", 5000)), 0o755)
+		a := &Agent{ID: "claude", Name: "Claude Code", Bin: "claude"}
+		if _, err := a.UpdateCLI(); err != nil {
+			t.Fatalf("UpdateCLI: %v", err)
+		}
+	})
+
+	t.Run("no install.cjs says how to finish", func(t *testing.T) {
+		_, _ = setup(t, false)
+		a := &Agent{ID: "claude", Name: "Claude Code", Bin: "claude"}
+		_, err := a.UpdateCLI()
+		if err == nil || !strings.Contains(err.Error(), "install.cjs") {
+			t.Errorf("no pointer at install.cjs: %v", err)
+		}
+	})
+}
+
 // An agent's CLI installed with bun is updated by bun add -g, which can't
 // use a SOCKS5 proxy (#1409): it is given the bridge in front of it. npm,
 // which can, is given the proxy as it is.

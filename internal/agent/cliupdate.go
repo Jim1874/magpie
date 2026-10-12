@@ -82,8 +82,12 @@ type cliSpec struct {
 	latest func() string
 }
 
+// claudeCodeNPM is the npm package of Claude Code, whose postinstall puts
+// the platform's native binary over bin/claude.exe.
+const claudeCodeNPM = "@anthropic-ai/claude-code"
+
 var cliSpecs = map[string]cliSpec{
-	"claude": {npm: []string{"@anthropic-ai/claude-code"}, brew: []string{"claude-code"},
+	"claude": {npm: []string{claudeCodeNPM}, brew: []string{"claude-code"},
 		self: func(bin, real string) []string {
 			// ~/.local/bin/claude → ~/.local/share/claude/versions/2.1.3;
 			// on Windows the binary itself, in ~/.local/bin
@@ -826,6 +830,20 @@ func (a *Agent) UpdateCLI() (CLI, error) {
 		// the prompt declined, or none shown: npm never ran
 		return CLI{}, &AdminError{Agent: a.Name, Prefix: u.prefix, Command: u.shown(), Via: "npm", Canceled: errors.Is(err, update.ErrCanceled), Err: err}
 	}
+	if err == nil {
+		// npm said it installed Claude Code, yet its postinstall may not
+		// have run (a user's --ignore-scripts, an --omit=optional): the
+		// platform's binary is already downloaded, but bin/claude.exe is
+		// still the stub that only prints "native binary not installed".
+		// Running the package's own install.cjs again places it; a failure
+		// doesn't hide npm's success, it says how to finish by hand.
+		if ferr := ensureClaudeNative(ctx, u, real); ferr != nil {
+			versions.forget(real)
+			shimTargets.forget(bin)
+			c, _ := a.CLI()
+			return c, ferr
+		}
+	}
 	if err == nil && u.reshim != nil {
 		// what it installed is kept even when no shim is made for it
 		runUpdate(ctx, &updater{via: "reshim", cmd: u.reshim})
@@ -846,6 +864,85 @@ func (a *Agent) UpdateCLI() (CLI, error) {
 		return c, fmt.Errorf("%s is still %s after %s; %s is out", a.Name, c.Version, u.shown(), c.Latest)
 	}
 	return c, nil
+}
+
+// claudeStubMark is what the placeholder bin/claude.exe of an npm
+// @anthropic-ai/claude-code install prints: its postinstall, which copies
+// the platform's native binary over it, didn't run.
+const claudeStubMark = "native binary not installed"
+
+// ensureClaudeNative places Claude Code's native binary after an npm update
+// left its placeholder stub: it runs the package's own install.cjs, which
+// links or copies the already-downloaded platform binary over
+// bin/claude.exe. It runs for that one package over npm only, after npm
+// itself succeeded, and touches nothing when the binary is already there.
+func ensureClaudeNative(ctx context.Context, u *updater, real string) error {
+	if u.via != "npm" || u.pkg != claudeCodeNPM {
+		return nil
+	}
+	// real is the link npm's bin points at, not the package file itself
+	if r, err := proc.RealPath(real); err == nil {
+		real = r
+	}
+	dir, stub, ok := claudeStubDir(real)
+	if !ok || !stub {
+		return nil
+	}
+	install := filepath.Join(dir, "install.cjs")
+	if !isFile(install) {
+		return fmt.Errorf("Claude Code updated, but its native program is missing; run node %s and update again", install)
+	}
+	node := "node"
+	if u.path != "" {
+		if n := filepath.Join(u.path, exe("node")); isFile(n) {
+			node = n // its own node, not another on PATH
+		}
+	} else if n, err := exec.LookPath("node"); err == nil {
+		node = n
+	}
+	cmd := proc.CommandContext(ctx, node, install)
+	cmd.Stdin = nil
+	cmd.Dir = dir
+	cmd.Env = updateEnv(u)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		msg := lastLines(string(out), 3)
+		if msg == "" {
+			msg = strings.TrimSpace(err.Error())
+		}
+		return fmt.Errorf("Claude Code updated, but placing its native program failed (%s); run node %s and update again", msg, install)
+	}
+	if _, stub, _ := claudeStubDir(real); stub {
+		return fmt.Errorf("Claude Code updated, but its native program is still missing; run node %s and update again", install)
+	}
+	return nil
+}
+
+// claudeStubDir is the npm package dir of the Claude Code CLI at real, and
+// whether its bin/claude.exe is still the placeholder stub: tiny, and
+// printing the missing-native message. ok is false when real isn't in that
+// package at all.
+func claudeStubDir(real string) (dir string, stub, ok bool) {
+	slash := filepath.ToSlash(real)
+	mark := "/node_modules/" + claudeCodeNPM + "/"
+	i := strings.Index(slash, mark)
+	if i < 0 {
+		return "", false, false
+	}
+	dir = filepath.FromSlash(slash[:i] + mark[:len(mark)-1])
+	exe := filepath.Join(dir, "bin", "claude.exe")
+	st, err := os.Stat(exe)
+	if err != nil || st.IsDir() {
+		return dir, false, true
+	}
+	if st.Size() >= 4096 {
+		return dir, false, true // a native binary is hundreds of megabytes
+	}
+	b, err := os.ReadFile(exe)
+	if err != nil {
+		return dir, false, true
+	}
+	return dir, strings.Contains(string(b), claudeStubMark), true
 }
 
 var ansiRe = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]`)
